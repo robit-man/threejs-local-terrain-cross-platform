@@ -679,46 +679,91 @@
                 });
             }
             update(dt) {
+                /* ------------------------- aliases / consts ------------------------- */
                 const { FWD, RIGHT } = this.consts.vectors;
-                const { BASE_SPEED, YAW_SPEED, DEADZONE, RUN_EASE, MIN_RUN, MAX_RUN, JUMP_EASE, CROUCH_EASE } = this.consts;
-                // vertical
-                if (this.input.jumpState !== 'idle') {
-                    this.dolly.position.y = THREE.MathUtils.lerp(
-                        this.dolly.position.y,
-                        this.input.jumpTarget,
-                        JUMP_EASE * dt
-                    );
-                    if (Math.abs(this.dolly.position.y - this.input.jumpTarget) < 0.01)
-                        this.input.jumpState = 'idle';
-                } else {
-                    const tgt = this.input.crouch ? this.input.CROUCH_Y : this.input.STAND_Y;
-                    this.dolly.position.y = THREE.MathUtils.lerp(this.dolly.position.y, tgt, CROUCH_EASE * dt);
+                const {
+                    BASE_SPEED, YAW_SPEED, DEADZONE,
+                    RUN_EASE, MIN_RUN, MAX_RUN,
+                    CROUCH_EASE          // JUMP_EASE no longer needed for physics jump
+                } = this.consts;
+                const inp = this.input;          // shorthand
+                const GRAV = 20;                  // “eye-units” · s⁻²  (tweak to taste)
+
+                /* -------- one-time per-run initialisation of vertical state --------- */
+                if (inp.eyeY === undefined) {
+                    inp.baseEye = inp.STAND_Y;
+                    inp.crouchEye = inp.CROUCH_Y;
+                    inp.jumpPeak = inp.baseEye * 1.5;
+                    inp.eyeY = inp.baseEye;
+                    inp.vertVel = 0;             // current vertical velocity
+                    inp.groundY = 0;             // updated by _snap()
                 }
 
+                /* ---------------- trigger: convert “up” into a real jump ------------ */
+                if (inp.jumpState === 'up') {              // set by space-bar / R-stick
+                    const h = inp.jumpPeak - inp.baseEye;
+                    inp.vertVel = Math.sqrt(2 * GRAV * h);   // v₀ for that height
+                    inp.jumpState = 'jumping';
+                }
+
+                /* --------------------------- vertical motion ------------------------ */
+                if (inp.jumpState === 'jumping') {         // simple ballistic arc
+                    inp.vertVel -= GRAV * dt;
+                    inp.eyeY += inp.vertVel * dt;
+
+                    /* landed?  clamp & finish */
+                    if (inp.eyeY <= inp.baseEye) {
+                        inp.eyeY = inp.baseEye;
+                        inp.vertVel = 0;
+                        inp.jumpState = 'idle';
+                    }
+                } else {                                   // stand / crouch easing
+                    const tgt = inp.crouch ? inp.crouchEye : inp.baseEye;
+                    inp.eyeY += (tgt - inp.eyeY) * Math.min(1, CROUCH_EASE * dt);
+                }
+
+                /* camera height = terrain + eye-offset */
+                this.dolly.position.y = inp.groundY + inp.eyeY;
+
+                /* --------------------------- VR locomotion -------------------------- */
                 if (this.renderer.xr.isPresenting) {
                     this.camera.getWorldDirection(FWD); FWD.y = 0; FWD.normalize();
                     RIGHT.crossVectors(FWD, new THREE.Vector3(0, 1, 0)).normalize();
+
                     this.renderer.xr.getSession().inputSources.forEach(src => {
                         const gp = src.gamepad; if (!gp) return;
                         const sx = gp.axes[2] || 0, sy = gp.axes[3] || 0;
+
+                        /* left-stick – move / run */
                         if (src.handedness === 'left') {
-                            const tgt = gp.buttons[1].value > 0.5 ? MAX_RUN : MIN_RUN;
-                            this.input.runMul += (tgt - this.input.runMul) * RUN_EASE * dt;
+                            const tgtMul = gp.buttons[1]?.value > 0.5 ? MAX_RUN : MIN_RUN;
+                            inp.runMul += (tgtMul - inp.runMul) * RUN_EASE * dt;
+
                             if (Math.hypot(sx, sy) > DEADZONE) {
-                                this.dolly.position.addScaledVector(RIGHT, sx * BASE_SPEED * dt * this.input.runMul);
-                                this.dolly.position.addScaledVector(FWD, -sy * BASE_SPEED * dt * this.input.runMul);
+                                this.dolly.position.addScaledVector(
+                                    RIGHT, sx * BASE_SPEED * dt * inp.runMul
+                                );
+                                this.dolly.position.addScaledVector(
+                                    FWD, -sy * BASE_SPEED * dt * inp.runMul
+                                );
                             }
                         }
+
+                        /* right-stick – yaw / jump / crouch */
                         if (src.handedness === 'right') {
-                            if (Math.abs(sx) > DEADZONE) this.dolly.rotation.y -= sx * YAW_SPEED * dt;
-                            if (sy < -DEADZONE && this.input.jumpState === 'idle') {
-                                this.input.jumpState = 'up'; this.input.jumpTarget = this.input.JUMP_Y;
-                            }
-                            this.input.crouch = sy > DEADZONE;
+                            if (Math.abs(sx) > DEADZONE)
+                                this.dolly.rotation.y -= sx * YAW_SPEED * dt;
+
+                            if (sy < -DEADZONE && inp.jumpState === 'idle')
+                                inp.jumpState = 'up';          // start jump next frame
+
+                            inp.crouch = sy > DEADZONE;
                         }
                     });
-                } else {
-                    /* 1) apply phone orientation if available */
+                }
+                /* --------------------- desktop / mobile locomotion ------------------ */
+                else {
+                    /* phone-orientation “look” --------------------------------------- */
                     if (this.platform.isMobile && this.orientation.ready) {
                         const { alpha: a, beta: b, gamma: g } = this.orientation;
                         const euler = new THREE.Euler(
@@ -727,33 +772,46 @@
                             THREE.MathUtils.degToRad(-g),
                             'YXZ'
                         );
-                        const quat = new THREE.Quaternion().setFromEuler(euler);
-                        /* phone frame → world frame correction (-90° around X) */
-                        quat.multiply(
-                            new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2)
-                        );
+                        const quat = new THREE.Quaternion().setFromEuler(euler)
+                            .multiply(
+                                new THREE.Quaternion().setFromAxisAngle(
+                                    new THREE.Vector3(1, 0, 0), -Math.PI / 2
+                                )
+                            );
                         this.dolly.quaternion.copy(quat);
                     }
 
-                    /* 2) movement */
-                    if (this.input.controls.isLocked || this.platform.isMobile) {
+                    /* keyboard / touch movement -------------------------------------- */
+                    if (inp.controls.isLocked || this.platform.isMobile) {
                         this.camera.getWorldDirection(FWD); FWD.y = 0; FWD.normalize();
                         RIGHT.crossVectors(FWD, new THREE.Vector3(0, 1, 0)).normalize();
+
                         let mx = 0, mz = 0;
-                        if (this.input.forward) mz++;
-                        if (this.input.backward) mz--;
-                        if (this.input.left) mx--;
-                        if (this.input.right) mx++;
+                        if (inp.forward) mz++;
+                        if (inp.backward) mz--;
+                        if (inp.left) mx--;
+                        if (inp.right) mx++;
+
                         mx += this.slide.x * this.slide.mag;
                         mz -= this.slide.y * this.slide.mag;
+
                         if (mx || mz) {
-                            const dir = new THREE.Vector3().addScaledVector(RIGHT, mx).addScaledVector(FWD, mz).normalize();
-                            const speed = BASE_SPEED * (this.input.shift ? MAX_RUN : MIN_RUN);
+                            const dir = new THREE.Vector3()
+                                .addScaledVector(RIGHT, mx)
+                                .addScaledVector(FWD, mz)
+                                .normalize();
+                            const speed = BASE_SPEED * (inp.shift ? MAX_RUN : MIN_RUN);
                             this.dolly.position.addScaledVector(dir, speed * dt);
                         }
                     }
                 }
+
+                /* 2nd clamp in case _snap() ran after our logic ---------------------- */
+                this.dolly.position.y = inp.groundY + inp.eyeY;
             }
+
+
+
         }
 
         class App {
@@ -779,13 +837,19 @@
                 this.movement = {
                     forward: false, backward: false, left: false, right: false,
                     shift: false, crouch: false,
-                    jumpState: 'idle', jumpTarget: 0,
-                    STAND_Y: this.sceneMgr.camera.position.y,
-                    JUMP_Y: this.sceneMgr.camera.position.y * 1.5,
-                    CROUCH_Y: this.sceneMgr.camera.position.y * 0.5,
+
+                    /* vertical state ---------------------------------------------- */
+                    groundY: 0,                     // updated every frame by _snap()
+                    baseEye: 1.6,                   // standing eye-height
+                    eyeY: 1.6,                   // current animated eye-height
+                    crouchEye: 0.8,                 // crouched eye-height  (½ of 1.6)
+                    jumpPeak: 2.4,                 // jump peak eye-height (×1.5)
+                    jumpState: 'idle',              // 'idle' | 'up' | 'down'
+
                     runMul: 1,
                     controls: this.controls
                 };
+
                 this.inputMgr = new InputManager(
                     this.platform,
                     this.sceneMgr.renderer,
@@ -827,9 +891,16 @@
 
             _update() {
                 const dt = this.clock.getDelta();
+
+                // ① read ground height & store it (do NOT touch eyeY)
+                const pos = this.sceneMgr.dolly.position;
+                this.movement.groundY = this.hexGridMgr.getHeightAt(pos.x, pos.z);
+
+                // ② animate input & apply (uses the new groundY)
                 this.moveCtrl.update(dt);
-                this._snap();
-                this.hexGridMgr.update(this.sceneMgr.dolly.position);
+
+                // ③ keep generating / rendering
+                this.hexGridMgr.update(pos);
                 this.sceneMgr.renderer.render(this.sceneMgr.scene, this.sceneMgr.camera);
             }
         }
