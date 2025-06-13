@@ -233,6 +233,7 @@
             get object() { return this.group; }
         }
 
+
         class TileManager {
             constructor(scene, spacing = 5, tileRadius = 50) {
                 this.scene = scene;
@@ -275,13 +276,14 @@
                 }, { once: true });
 
                 if (!TileManager._tmpV) TileManager._tmpV = new THREE.Vector3();
+                this._lastHeight = 0;
             }
 
             static minY = Infinity;
             static maxY = -Infinity;
             static _globalRecolorPending = false;
 
-            // schedule full‐scene recolor
+            // schedule a full‐scene recolor next frame
             _scheduleGlobalRecolor() {
                 if (TileManager._globalRecolorPending) return;
                 TileManager._globalRecolorPending = true;
@@ -293,15 +295,27 @@
                 });
             }
 
-            // public API
+            // public: sample terrain height
             getHeightAt(x, z) {
+                // reuse tmp vector
                 TileManager._tmpV.set(x, 100, z);
                 this.ray.set(TileManager._tmpV, this.DOWN);
+
+                // cache meshes list if you want to micro-optimize this
                 const meshes = Array.from(this.tiles.values()).map(d => d.grid.mesh);
                 const hit = this.ray.intersectObjects(meshes, true);
-                return hit.length ? hit[0].point.y : 0;
+
+                if (hit.length) {
+                    // store and return the real surface
+                    this._lastHeight = hit[0].point.y;
+                    return this._lastHeight;
+                } else {
+                    // if no hit, stay locked to last height
+                    return this._lastHeight;
+                }
             }
 
+            // called each frame with player position
             update(playerPos) {
                 if (!this.origin) return;
                 const a = this.tileRadius;
@@ -312,7 +326,7 @@
                 const dist = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds)) * a;
                 if (dist < 15) return;
 
-                // load new neighbors
+                // choose 1–2 directions to expand
                 const dots = DIRS
                     .map(([dx, dy]) => ({ dir: [dx, dy], dot: dq * dx + dr * dy }))
                     .sort((a, b) => b.dot - a.dot);
@@ -327,31 +341,34 @@
                 }
             }
 
-            // ensure tile exists; enforce LRU max 100
+            // ensure tile exists, bump LRU, recolor on recall
             _ensureTile(q, r) {
                 const id = `${q},${r}`;
                 if (this.tiles.has(id)) {
-                    // bump to newest
+                    // bump to most‐recent
                     const entry = this.tiles.get(id);
                     this.tiles.delete(id);
                     this.tiles.set(id, entry);
+                    // immediately recolor recalled tile (and neighbors)
+                    this._scheduleGlobalRecolor();
                 } else {
                     this.addTile(q, r);
                 }
-                // prune oldest
-                while (this.tiles.size > 1000) {
+                // prune oldest if over 100
+                while (this.tiles.size > 800) {
                     const oldest = this.tiles.keys().next().value;
                     this._disposeTile(oldest);
                 }
             }
 
+            // create a new hex tile at grid coords (q,r)
             addTile(q, r) {
                 const id = `${q},${r}`;
                 const grid = new UniformHexGrid(this.spacing, this.tileRadius * 2);
                 grid.id = id;
                 grid.group.name = `tile-${id}`;
 
-                // position
+                // position in world
                 const a = this.tileRadius;
                 grid.group.position.set(
                     1.5 * a * q,
@@ -359,7 +376,7 @@
                     a * (Math.sqrt(3) / 2 * q + Math.sqrt(3) * r)
                 );
 
-                // ensure color attribute
+                // ensure vertex‐color attribute
                 const geom = grid.geometry;
                 if (!geom.attributes.color) {
                     const arr = new Float32Array(geom.attributes.position.count * 3);
@@ -379,41 +396,43 @@
                 }
                 const seedH = cnt ? sum / cnt : 0;
 
-                // init vertices
+                // initialize vertex heights
                 const pos = geom.attributes.position;
                 for (let i = 0; i < pos.count; i++) pos.setY(i, seedH);
                 pos.needsUpdate = true;
 
-                // track state
+                // per‐tile state
                 const elevArr = Array(pos.count).fill(null);
                 const fetched = new Set();
                 this.tiles.set(id, { grid, q, r, elevArr, fetched, populating: false });
                 this.scene.add(grid.group);
 
-                // begin populate
+                // kick off async elevation fetch
                 setTimeout(() => this._populate(id), 0);
             }
 
+            // fetch elevations for any missing verts
             _populate(id) {
                 const data = this.tiles.get(id);
                 if (!data || !this.origin || data.populating) return;
                 data.populating = true;
 
                 const { grid, elevArr, fetched } = data;
-                const geom = grid.geometry;
-                const pos = geom.attributes.position;
+                const pos = grid.geometry.attributes.position;
                 const n = pos.count;
 
-                // smooth helper
+                // helper: smooth‐fill missing verts from fetched average
                 const smoothFill = () => {
                     if (!fetched.size) return;
                     let s = 0; fetched.forEach(i => s += pos.getY(i));
                     const avg = s / fetched.size;
-                    for (let j = 0; j < n; j++) if (!fetched.has(j)) pos.setY(j, avg);
+                    for (let j = 0; j < n; j++) {
+                        if (!fetched.has(j)) pos.setY(j, avg);
+                    }
                     pos.needsUpdate = true;
                 };
 
-                // reload cache
+                // reload local cache
                 const raw = localStorage.getItem(`tile:${id}`);
                 if (raw) {
                     try {
@@ -430,7 +449,7 @@
                     }
                 }
 
-                // build queue
+                // queue missing indices
                 const queue = [];
                 for (let i = 0; i < n; i++) if (!fetched.has(i)) queue.push(i);
                 if (!queue.length) {
@@ -438,7 +457,7 @@
                     return this._finalizeTile(id);
                 }
 
-                // edges last
+                // fill edges last
                 queue.sort((a, b) => {
                     const ax = pos.getX(a), az = pos.getZ(a);
                     const bx = pos.getX(b), bz = pos.getZ(b);
@@ -454,7 +473,7 @@
                     pos.setY(i, val);
                     elevArr[i] = val;
                     fetched.add(i);
-                    // expand extremes only
+                    // expand global min/max only
                     TileManager.minY = Math.min(TileManager.minY, val);
                     TileManager.maxY = Math.max(TileManager.maxY, val);
                     smoothFill();
@@ -487,6 +506,7 @@
                 dequeue();
             }
 
+            // finalize: bake normals, average height, stitch and cache
             _finalizeTile(id) {
                 const data = this.tiles.get(id);
                 if (!data) return;
@@ -495,24 +515,25 @@
                 grid.geometry.attributes.position.setUsage(THREE.StaticDrawUsage);
                 grid.avgHeight = elevArr.reduce((s, v) => s + v, 0) / fetched.size;
 
-                // stitch edges—directional: existing neighbor overrides this new tile
+                // stitch edges: existing neighbor heights override this tile
                 this._stitchEdges(id);
 
-                // persist cache
+                // persist
                 localStorage.setItem(
                     `tile:${id}`,
                     JSON.stringify({ elevArr, fetched: Array.from(fetched) })
                 );
             }
 
+            // align shared vertices: neighbor B yields to A on recall
             _stitchEdges(id) {
                 const dataA = this.tiles.get(id);
                 const { grid: gridA, fetched: fetchedA } = dataA;
                 const posA = gridA.geometry.attributes.position;
                 const nA = posA.count;
-
-                // map world → index for A
                 const mapA = new Map();
+
+                // world → index for A
                 for (let i = 0; i < nA; i++) {
                     const wx = gridA.group.position.x + posA.getX(i);
                     const wz = gridA.group.position.z + posA.getZ(i);
@@ -523,11 +544,11 @@
                     const nid = `${dataA.q + dx},${dataA.r + dy}`;
                     const dataB = this.tiles.get(nid);
                     if (!dataB) continue;
-                    const { grid: gridB, fetched: fetchedB } = dataB;
+                    const { grid: gridB } = dataB;
                     const posB = gridB.geometry.attributes.position;
                     const nB = posB.count;
 
-                    // map world → index for B
+                    // world → index for B
                     const mapB = new Map();
                     for (let j = 0; j < nB; j++) {
                         const wx = gridB.group.position.x + posB.getX(j);
@@ -535,16 +556,14 @@
                         mapB.set(`${wx.toFixed(3)},${wz.toFixed(3)}`, j);
                     }
 
-                    // directional stitch: neighbor (B) yields to A → B adopts A's height
+                    // B adopts A's heights where A has real data
                     for (const [key, i] of mapA.entries()) {
-                        if (!fetchedA.has(i)) continue;     // skip if A doesn't have real data
-                        if (!mapB.has(key)) continue;
+                        if (!fetchedA.has(i)) continue;
                         const j = mapB.get(key);
-                        // B takes A's height
-                        const yA = posA.getY(i);
-                        posB.setY(j, yA);
+                        if (j !== undefined) {
+                            posB.setY(j, posA.getY(i));
+                        }
                     }
-
                     posB.needsUpdate = true;
                     gridB.geometry.computeVertexNormals();
                 }
@@ -559,7 +578,6 @@
                 const n = pos.count;
                 const minY = TileManager.minY, maxY = TileManager.maxY;
                 const span = Math.max(1e-6, maxY - minY);
-
                 for (let i = 0; i < n; i++) {
                     const y = pos.getY(i);
                     const t = THREE.MathUtils.clamp((y - minY) / span, 0, 1);
