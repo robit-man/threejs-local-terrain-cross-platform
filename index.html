@@ -94,6 +94,68 @@
         import LZString from 'lz-string';
         const c16 = LZString.compressToUTF16;
         const d16 = LZString.decompressFromUTF16;
+
+        const DIRS = [[1, 0], [0, 1], [-1, 1], [-1, 0], [0, -1], [1, -1]];
+        const BUCKET_SIZE = 50;                // color‐bucket height in meters
+        const TILE_CACHE_SAVE_INTERVAL = 100;  // ms between localStorage commits
+
+        const Geohash = (() => {
+            const BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+
+            /**
+             * Encode latitude and longitude into a geohash string.
+             * @param {number} latitude  - latitude in degrees
+             * @param {number} longitude - longitude in degrees
+             * @param {number} [precision=7] - number of characters in resulting geohash
+             * @returns {string} the geohash
+             */
+            function encode(latitude, longitude, precision = 7) {
+                let isEven = true;
+                let bit = 0;
+                let ch = 0;
+                let geohash = "";
+
+                let latMin = -90.0, latMax = 90.0;
+                let lonMin = -180.0, lonMax = 180.0;
+
+                while (geohash.length < precision) {
+                    if (isEven) {
+                        // refine longitude interval
+                        const mid = (lonMin + lonMax) / 2;
+                        if (longitude >= mid) {
+                            ch |= 1 << (4 - bit);
+                            lonMin = mid;
+                        } else {
+                            lonMax = mid;
+                        }
+                    } else {
+                        // refine latitude interval
+                        const mid = (latMin + latMax) / 2;
+                        if (latitude >= mid) {
+                            ch |= 1 << (4 - bit);
+                            latMin = mid;
+                        } else {
+                            latMax = mid;
+                        }
+                    }
+
+                    isEven = !isEven;
+
+                    if (bit < 4) {
+                        bit++;
+                    } else {
+                        // 5 bits accumulated, map to base32 char
+                        geohash += BASE32[ch];
+                        bit = 0;
+                        ch = 0;
+                    }
+                }
+
+                return geohash;
+            }
+
+            return { encode };
+        })();
         // --- Utilities for hex grid & elevation caching ---
         class Utils {
             static smoothstep(t) {
@@ -171,54 +233,91 @@
             get object() { return this.group; }
         }
 
-        // REPLACE ENTIRE TileManager ────────────────────────────────────────────────
         class TileManager {
             constructor(scene, spacing = 5, tileRadius = 50) {
                 this.scene = scene;
                 this.spacing = spacing;
                 this.tileRadius = tileRadius;
-
-                this.tiles = new Map();          // id → { grid,q,r }
-                this.origin = null;               // { lat,lon }
-                this.elevCache = this._loadCache();  // fine-grained lat/lon cache
+                this.tiles = new Map();    // id → { grid, q, r, elevArr, fetched, populating }
+                this.origin = null;         // set on first gps‐updated
+                this.elevCache = this._loadCache();
 
                 this.ray = new THREE.Raycaster();
                 this.DOWN = new THREE.Vector3(0, -1, 0);
 
-                /* Origin becomes available when SensorManager fires first gps-updated */
+                // basic lighting
+                if (!scene.userData._tmLightsAdded) {
+                    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+                    const dl = new THREE.DirectionalLight(0xffffff, 0.6);
+                    dl.position.set(50, 100, 50);
+                    dl.castShadow = true;
+                    scene.add(dl);
+                    scene.userData._tmLightsAdded = true;
+                }
+
+                // shared terrain material
+                if (!TileManager.sharedMat) {
+                    TileManager.sharedMat = new THREE.MeshStandardMaterial({
+                        vertexColors: true,
+                        flatShading: false,
+                        metalness: 0.2,
+                        roughness: 0.8,
+                        side: THREE.DoubleSide
+                    });
+                }
+
+                // wait for GPS fix
                 document.addEventListener('gps-updated', e => {
-                    if (!this.origin) this.origin = e.detail;
+                    if (!this.origin) {
+                        this.origin = e.detail;
+                        this.addTile(0, 0);
+                    }
                 }, { once: true });
 
-                /* always start with central tile */
-                this.addTile(0, 0);
+                // temp vector for raycasts
+                if (!TileManager._tmpV) TileManager._tmpV = new THREE.Vector3();
             }
 
-            /* ─────────────────────── public helpers ───────────────────────── */
+            static minY = Infinity;
+            static maxY = -Infinity;
+            static _globalRecolorPending = false;
 
+            // schedule full‐scene recolor
+            _scheduleGlobalRecolor() {
+                if (TileManager._globalRecolorPending) return;
+                TileManager._globalRecolorPending = true;
+                requestAnimationFrame(() => {
+                    for (const { grid } of this.tiles.values()) {
+                        this._recolorTile(grid);
+                    }
+                    TileManager._globalRecolorPending = false;
+                });
+            }
+
+            // public API
             getHeightAt(x, z) {
-                this.ray.set(new THREE.Vector3(x, 100, z), this.DOWN);
-                const meshes = Array.from(this.tiles.values()).map(t => t.grid.mesh);
+                TileManager._tmpV.set(x, 100, z);
+                this.ray.set(TileManager._tmpV, this.DOWN);
+                const meshes = Array.from(this.tiles.values()).map(d => d.grid.mesh);
                 const hit = this.ray.intersectObjects(meshes, true);
                 return hit.length ? hit[0].point.y : 0;
             }
 
             update(playerPos) {
-                /* decide whether to add neighbouring tiles (same maths as before) */
+                if (!this.origin) return;
                 const a = this.tileRadius;
                 const qf = (2 / 3 * playerPos.x) / a;
                 const rf = ((-1 / 3 * playerPos.x) + (Math.sqrt(3) / 3 * playerPos.z)) / a;
-
-                const q0 = Math.round(qf);
-                const r0 = Math.round(rf);
-
+                const q0 = Math.round(qf), r0 = Math.round(rf);
                 const dq = qf - q0, dr = rf - r0, ds = -dq - dr;
                 const dist = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds)) * a;
                 if (dist < 15) return;
 
-                const DIRS = [[1, 0], [0, 1], [-1, 1], [-1, 0], [0, -1], [1, -1]];
-                const dots = DIRS.map(([dx, dy]) => ({ dir: [dx, dy], dot: dq * dx + dr * dy }))
+                // load new neighbors
+                const dots = DIRS
+                    .map(([dx, dy]) => ({ dir: [dx, dy], dot: dq * dx + dr * dy }))
                     .sort((a, b) => b.dot - a.dot);
+
                 const toAdd = [dots[0].dir];
                 if (dots[1].dot > 0.5 * dots[0].dot) toAdd.push(dots[1].dir);
 
@@ -229,218 +328,205 @@
                 }
             }
 
-            /* ───────────────────── internal: ensure tile exists ───────────── */
-
+            // ensure tile exists; prune LRU beyond 100
             _ensureTile(q, r) {
                 const id = `${q},${r}`;
-                if (!this.tiles.has(id)) this.addTile(q, r);
+                if (this.tiles.has(id)) {
+                    // move to end = most‐recent
+                    const entry = this.tiles.get(id);
+                    this.tiles.delete(id);
+                    this.tiles.set(id, entry);
+                    // no auto‐respawn of populate here
+                } else {
+                    this.addTile(q, r);
+                }
+                // prune oldest
+                while (this.tiles.size > 100) {
+                    const oldest = this.tiles.keys().next().value;
+                    this._disposeTile(oldest);
+                }
             }
-
-            /* ───────────────────────── addTile ─────────────────────────────── */
 
             addTile(q, r) {
+                const id = `${q},${r}`;
                 const grid = new UniformHexGrid(this.spacing, this.tileRadius * 2);
-                grid.id = `${q},${r}`;
-                grid.group.name = `tile-${grid.id}`;
+                grid.id = id;
+                grid.group.name = `tile-${id}`;
 
+                // position
                 const a = this.tileRadius;
-                const wx = a * (3 / 2 * q);
-                const wz = a * (Math.sqrt(3) / 2 * q + Math.sqrt(3) * r);
-                grid.group.position.set(wx, 0, wz);
+                grid.group.position.set(
+                    1.5 * a * q,
+                    0,
+                    a * (Math.sqrt(3) / 2 * q + Math.sqrt(3) * r)
+                );
 
+                // ensure color attr
+                const geom = grid.geometry;
+                if (!geom.attributes.color) {
+                    const arr = new Float32Array(geom.attributes.position.count * 3);
+                    geom.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+                }
+
+                // apply shared material
+                grid.mesh.material = TileManager.sharedMat;
+
+                // seed height from neighbors
+                let sum = 0, cnt = 0;
+                for (const [dx, dy] of DIRS) {
+                    const n = this.tiles.get(`${q + dx},${r + dy}`);
+                    if (n && Number.isFinite(n.grid.avgHeight)) {
+                        sum += n.grid.avgHeight; cnt++;
+                    }
+                }
+                const seedH = cnt ? sum / cnt : 0;
+
+                // init vertex heights
+                const pos = geom.attributes.position;
+                for (let i = 0; i < pos.count; i++) pos.setY(i, seedH);
+                pos.needsUpdate = true;
+
+                const elevArr = Array(pos.count).fill(null);
+                const fetched = new Set();
+                this.tiles.set(id, { grid, q, r, elevArr, fetched, populating: false });
                 this.scene.add(grid.group);
-                this.tiles.set(grid.id, { grid, q, r });
 
-                /* populate immediately if we already know origin, otherwise wait */
-                if (this.origin) this._populate(grid);
-                else document.addEventListener('gps-updated', () => this._populate(grid), { once: true });
+                // start fetching
+                setTimeout(() => this._populate(id), 0);
             }
 
-            /* ───────────────────────── populate ────────────────────────────── */
+            _populate(id) {
+                const data = this.tiles.get(id);
+                if (!data || !this.origin) return;
+                if (data.populating) return;           // guard against re‐entry
+                data.populating = true;
 
-            /* REPLACE ENTIRE _populate METHOD ────────────────────────────────── */
-            _populate(grid) {
-                if (!this.origin) return;                      // still waiting for GPS
+                const { grid, elevArr, fetched } = data;
+                const geom = grid.geometry;
+                const pos = geom.attributes.position;
+                const n = pos.count;
 
-                const posAttr = grid.geometry.attributes.position;
-                const colAttr = grid.geometry.attributes.color;
-                const tp = posAttr.array;
-                const ca = colAttr.array;
-                const vCount = tp.length / 3;
-                const [q, r] = grid.id.split(',').map(Number);
-
-                /* ── 1. load cached elevations (number | null) ───────────────── */
-                const elevArr = this._loadTile(q, r, vCount);
-                elevArr.forEach((y, i) => {
-                    if (Number.isFinite(y)) {
-                        tp[3 * i + 1] = y;
-                        this._setCol(i, y, ca);
+                // smooth helper
+                const smoothFill = () => {
+                    if (!fetched.size) return;
+                    let s = 0;
+                    fetched.forEach(i => s += pos.getY(i));
+                    const avg = s / fetched.size;
+                    for (let j = 0; j < n; j++) {
+                        if (!fetched.has(j)) pos.setY(j, avg);
                     }
+                    pos.needsUpdate = true;
+                };
+
+                // reload cache
+                const raw = localStorage.getItem(`tile:${id}`);
+                if (raw) {
+                    try {
+                        const obj = JSON.parse(raw);
+                        obj.fetched.forEach(i => {
+                            elevArr[i] = obj.elevArr[i];
+                            pos.setY(i, obj.elevArr[i]);
+                            fetched.add(i);
+                        });
+                        pos.needsUpdate = true;
+                        smoothFill();
+                    } catch {
+                        localStorage.removeItem(`tile:${id}`);
+                    }
+                }
+
+                // build queue
+                const queue = [];
+                for (let i = 0; i < n; i++) if (!fetched.has(i)) queue.push(i);
+                if (!queue.length) {
+                    data.populating = false;
+                    return this._finalizeTile(id);
+                }
+
+                // edges last
+                queue.sort((a, b) => {
+                    const ax = pos.getX(a), az = pos.getZ(a);
+                    const bx = pos.getX(b), bz = pos.getZ(b);
+                    return (bx * bx + bz * bz) - (ax * ax + az * az);
                 });
-                posAttr.needsUpdate = colAttr.needsUpdate = true;
-                grid.geometry.computeVertexNormals();
 
-                /* ── 2. prep bookkeeping sets ────────────────────────────────── */
-                /* ───────────────────── indices still missing ───────────────────── */
-                const missing = elevArr
-                    .map((v, i) => (!Number.isFinite(v) ? i : -1))
-                    .filter(i => i !== -1);
-
-                grid._remaining = missing.length;
-                grid._pending = new Set(missing);
-                grid._retryCount = new Map();                         // idx → tries so far
-                if (grid._remaining === 0) {                          // nothing to do
-                    console.log(`[Tile ${q},${r}] already complete ✅`);
-                    return;
-                }
-                console.log(`[Tile ${q},${r}] need ${grid._remaining}/${vCount} vertices`);
-
-                const order = missing
-                    .map(i => ({ i, d: Math.hypot(tp[3 * i], tp[3 * i + 2]) }))
-                    .sort((a, b) => b.d - a.d)                          // far → near
-                    .map(o => o.i);                                     // keep only indices
-
-                /* ───────────────────── queue w/ concurrency ─────────────────────── */
-                const MAX_CONCURRENCY = 20;            // tune ↑/↓ if you like
-                const MAX_TRIES = 10;
+                const mLat = 111320;
+                const mLon = 111320 * Math.cos(this.origin.lat * Math.PI / 180);
+                const MAX_CON = 6;
                 let active = 0;
-                const queue = [...order];   // simple FIFO
 
-                const startNext = () => {
-                    if (active >= MAX_CONCURRENCY || queue.length === 0) return;
-                    const idx = queue.shift();
-                    active++;
-                    fetchVertex(idx);
-                };
-
-                /* --------------------------- helpers ------------------------------ */
-                const mLat = 111_320;
-                const mLon = 111_320 * Math.cos(this.origin.lat * Math.PI / 180);
-
-                const applyElevation = (idx, val, ok = true) => {
-                    if (ok) {
-                        tp[3 * idx + 1] = val;
-                        this._setCol(idx, val, ca);
-                        elevArr[idx] = val;
-                        grid._pending.delete(idx);
-                        grid._remaining--;
-                    } else {                                           // failure → maybe retry
-                        const tries = grid._retryCount.get(idx) ?? 0;
-                        if (tries < MAX_TRIES) {
-                            grid._retryCount.set(idx, tries + 1);
-                            setTimeout(() => queue.push(idx) && startNext(), (tries + 1) * 200);
-                        } else {
-                            console.warn(`[Tile ${q},${r}] gave up on idx ${idx}`);
-                        }
-                    }
-
-                    /* persist & refresh visuals */
-                    this._cachePartial(q, r, elevArr);
-                    posAttr.needsUpdate = colAttr.needsUpdate = true;
-                    grid.geometry.computeVertexNormals();
-
-                    /* spawn more work */
-                    active--;
-                    startNext();
-
-                    if (grid._remaining === 0 && active === 0) {
-                        console.log(`[Tile ${q},${r}] complete & cached 🎉`);
+                const apply = (i, val) => {
+                    pos.setY(i, val);
+                    elevArr[i] = val;
+                    fetched.add(i);
+                    // update extremes only expanding
+                    TileManager.minY = Math.min(TileManager.minY, val);
+                    TileManager.maxY = Math.max(TileManager.maxY, val);
+                    smoothFill();
+                    this._scheduleGlobalRecolor();
+                    active--; dequeue();
+                    if (active === 0 && fetched.size === n) {
+                        data.populating = false;
+                        this._finalizeTile(id);
                     }
                 };
 
-                const fetchVertex = idx => {
-                    const wx = grid.group.position.x + tp[3 * idx];
-                    const wz = grid.group.position.z + tp[3 * idx + 2];
-                    const lat = this.origin.lat + wz / mLat;
-                    const lon = this.origin.lon + wx / mLon;
-
-                    const cached = this._elevCache(lat, lon);
-                    if (cached != null) {
-                        applyElevation(idx, cached);          // instant cache hit
-                        return;
+                const dequeue = () => {
+                    while (active < MAX_CON && queue.length) {
+                        const i = queue.shift(); active++;
+                        const wx = grid.group.position.x + pos.getX(i);
+                        const wz = grid.group.position.z + pos.getZ(i);
+                        const lat = this.origin.lat + wz / mLat;
+                        const lon = this.origin.lon + wx / mLon;
+                        const c = this._elevCache(lat, lon);
+                        if (c != null) apply(i, c);
+                        else fetch(
+                            `https://epqs.nationalmap.gov/v1/json?x=${lon}&y=${lat}&wkid=4326&units=Meters`
+                        )
+                            .then(r => r.json())
+                            .then(d => apply(i, d.value || 0))
+                            .catch(() => apply(i, 0));
                     }
-
-                    fetch(`https://epqs.nationalmap.gov/v1/json?x=${lon}&y=${lat}&wkid=4326&units=Meters`)
-                        .then(r => r.json())
-                        .then(d => {
-                            const v = d.value ?? 0;
-                            this._storeCache(lat, lon, v);
-                            applyElevation(idx, v);
-                        })
-                        .catch(() => applyElevation(idx, null, /* ok = */ false));
                 };
 
-                /* ───────────────────── kick it off ──────────────────────────────── */
-                for (let i = 0; i < MAX_CONCURRENCY; i++) startNext();
+                dequeue();
             }
 
+            _finalizeTile(id) {
+                const { grid, elevArr, fetched } = this.tiles.get(id);
+                grid.geometry.computeVertexNormals();
+                grid.geometry.attributes.position.setUsage(THREE.StaticDrawUsage);
+                grid.avgHeight = elevArr.reduce((s, v) => s + v, 0) / fetched.size;
+                localStorage.setItem(
+                    `tile:${id}`,
+                    JSON.stringify({ elevArr, fetched: Array.from(fetched) })
+                );
+            }
 
-            /* ─────────────────────── colour helper ────────────────────────── */
-
-            _setCol(i, y, ca) {
-                const oldMin = TileManager.minY ?? Infinity;
-                const oldMax = TileManager.maxY ?? -Infinity;
-
-                /* update global extrema */
-                TileManager.minY = Math.min(oldMin, y);
-                TileManager.maxY = Math.max(oldMax, y);
-
-                /* tint this single vertex first */
-                const span1 = Math.max(1e-6, TileManager.maxY - TileManager.minY);
-                const t1 = THREE.MathUtils.clamp((y - TileManager.minY) / span1, 0, 1);
-                ca[3 * i] = t1;
-                ca[3 * i + 1] = 0.4 + 0.6 * t1;
-                ca[3 * i + 2] = 0.8 * (1 - t1);
-
-                /* if the extrema changed, recolor every vertex in every tile */
-                if (oldMin !== TileManager.minY || oldMax !== TileManager.maxY) {
-                    this._recolorAll();
+            _recolorTile(grid) {
+                const pos = grid.geometry.attributes.position;
+                const col = grid.geometry.attributes.color;
+                const n = pos.count;
+                const minY = TileManager.minY, maxY = TileManager.maxY;
+                const span = Math.max(1e-6, maxY - minY);
+                for (let i = 0; i < n; i++) {
+                    const y = pos.getY(i);
+                    const t = THREE.MathUtils.clamp((y - minY) / span, 0, 1);
+                    col.setXYZ(i, t, 0.4 + 0.6 * t, 0.8 * (1 - t));
                 }
+                col.needsUpdate = true;
             }
 
-            /* helper: recolor the whole world with the new min/max */
-            _recolorAll() {
-                const span = Math.max(1e-6, TileManager.maxY - TileManager.minY);
-                for (const { grid } of this.tiles.values()) {
-                    const pa = grid.geometry.attributes.position.array;
-                    const ca = grid.geometry.attributes.color.array;
-                    const n = pa.length / 3;
-                    for (let v = 0; v < n; v++) {
-                        const y = pa[3 * v + 1];
-                        const t = THREE.MathUtils.clamp((y - TileManager.minY) / span, 0, 1);
-                        ca[3 * v] = t;
-                        ca[3 * v + 1] = 0.4 + 0.6 * t;
-                        ca[3 * v + 2] = 0.8 * (1 - t);
-                    }
-                    grid.geometry.attributes.color.needsUpdate = true;
-                }
-            }
-
-            /* ─────────────────────── caching helpers ──────────────────────── */
-
-            _cachePartial(q, r, elevArr) {
-                /* save even if some entries are still null/NaN */
-                const comp = c16(JSON.stringify(elevArr));
-
-                localStorage.setItem(`tile:${q},${r}`, comp);
-            }
-
-            _loadTile(q, r, expectedLen) {
-                const raw = localStorage.getItem(`tile:${q},${r}`);
-                if (!raw) return Array(expectedLen).fill(null);
-                try {
-                    const arr = JSON.parse(d16(raw));
-                    /* ensure length integrity */
-                    if (!Array.isArray(arr) || arr.length !== expectedLen) throw 'len';
-                    return arr.map(v => Number.isFinite(v) ? v : null);
-                } catch {
-                    localStorage.removeItem(`tile:${q},${r}`);
-                    return Array(expectedLen).fill(null);
-                }
+            _disposeTile(id) {
+                const { grid } = this.tiles.get(id);
+                this.scene.remove(grid.group);
+                grid.geometry.dispose();
+                grid.mesh?.material.dispose();
+                this.tiles.delete(id);
             }
 
             _loadCache() {
-                try { return JSON.parse(localStorage.getItem('elevCacheV1') || '{}'); }
+                try { return JSON.parse(localStorage.getItem('elevCacheV1')) || {}; }
                 catch { return {}; }
             }
             _elevCache(lat, lon) {
@@ -453,7 +539,6 @@
                 localStorage.setItem('elevCacheV1', JSON.stringify(this.elevCache));
             }
         }
-
 
         // --- Rest of app classes (Platform, SensorManager, SceneManager, etc.) ---
         class Platform {
@@ -814,42 +899,36 @@
 
         }
 
+
         class App {
             constructor() {
                 if (location.protocol !== 'https:') {
                     location.href = 'https:' + window.location.href.substring(location.protocol.length);
                 }
 
+                // ─── core setup ───────────────────────────────────
                 this.platform = new Platform();
                 this.hintEl = document.getElementById('hint');
                 this.requestBtn = document.getElementById('request');
                 this.sensorMgr = new SensorManager(this.requestBtn, this.hintEl, this.platform);
-                new GeoRequester(document.getElementById('geo'));           // <── new line
+                new GeoRequester(document.getElementById('geo'));
 
                 this.sceneMgr = new SceneManager(this.platform);
                 new XRControllerManager(this.sceneMgr.renderer, this.sceneMgr.dolly);
 
-                // hex grid instead of GridHelper
                 this.hexGridMgr = new TileManager(this.sceneMgr.scene, 5, 50, 5);
 
-                // pointer-lock & input (must do this *before* snapping, so movement.STAND_Y exists)
+                // ─── first-person movement ─────────────────────────
                 this.controls = new PointerLockControls(this.sceneMgr.dolly, document.body);
                 this.movement = {
                     forward: false, backward: false, left: false, right: false,
                     shift: false, crouch: false,
-
-                    /* vertical state ---------------------------------------------- */
-                    groundY: 0,                     // updated every frame by _snap()
-                    baseEye: 1.6,                   // standing eye-height
-                    eyeY: 1.6,                   // current animated eye-height
-                    crouchEye: 0.8,                 // crouched eye-height  (½ of 1.6)
-                    jumpPeak: 2.4,                 // jump peak eye-height (×1.5)
-                    jumpState: 'idle',              // 'idle' | 'up' | 'down'
-
+                    groundY: 0,
+                    baseEye: 1.6, eyeY: 1.6,
+                    crouchEye: 0.8, jumpPeak: 2.4, jumpState: 'idle',
                     runMul: 1,
                     controls: this.controls
                 };
-
                 this.inputMgr = new InputManager(
                     this.platform,
                     this.sceneMgr.renderer,
@@ -858,8 +937,6 @@
                     this.movement.slide = { x: 0, y: 0, mag: 0 },
                     this.sensorMgr
                 );
-
-                // **initial snap** to terrain now that STAND_Y is defined
                 this._snap();
 
                 this.consts = {
@@ -868,10 +945,53 @@
                     JUMP_EASE: 4, CROUCH_EASE: 6,
                     vectors: { FWD: new THREE.Vector3(), RIGHT: new THREE.Vector3() }
                 };
+                this.moveCtrl = new MovementController(
+                    this.sceneMgr, this.movement, this.consts, this.platform
+                );
 
-                this.moveCtrl = new MovementController(this.sceneMgr, this.movement, this.consts, this.platform);
+                // ─── birds-eye spherical & speed setup ─────────────────
+                this.birdsCamera = new THREE.PerspectiveCamera(
+                    75, window.innerWidth / window.innerHeight, 0.05, 1000
+                );
+                this._birdsOffsetEnd = new THREE.Vector3(0, 200, -200);
+                this._birdsSphericalStart = new THREE.Spherical();
+                this._birdsSphericalEnd = new THREE.Spherical();
+                this._birdsSphericalCur = new THREE.Spherical();
+                this._birdsSphericalEnd.setFromVector3(this._birdsOffsetEnd);
+                this._basePhi = this._birdsSphericalEnd.phi;
+                const maxDeg = 10;
+                this._maxPitchDelta = THREE.MathUtils.degToRad(maxDeg);
+                this._minPhi = this._basePhi - this._maxPitchDelta;
+                this._maxPhi = this._basePhi + this._maxPitchDelta;
 
+                this._birdsLerp = 0;
+                this.isBirdsEye = false;
+                this._resetPitch = false;
+                this._pitchEase = 5;
+                this._pitchResetTimeout = null;
+
+                // birds-eye speed multipliers
+                this.shiftHoldTime = 0;
+                this.birdWalkMultiplier = 20;
+                this.birdRunRampRate = 0.5;
+                this.maxBirdRunMultiplier = 4;
+
+                // track whether pointer is locked for orbit
+                this.birdsPointerLocked = false;
+
+                // bind & listen
+                this._onWheel = this._onWheel.bind(this);
+                this._onBirdsMouse = this._onBirdsMouse.bind(this);
+                this._onPointerLockChange = this._onPointerLockChange.bind(this);
+                this._onClickLock = this._onClickLock.bind(this);
+
+                window.addEventListener('wheel', this._onWheel, { passive: true });
+                window.addEventListener('mousemove', this._onBirdsMouse);
                 window.addEventListener('resize', () => this._onResize());
+                document.addEventListener('pointerlockchange', this._onPointerLockChange);
+                // allow re-locking when clicking in birds-eye
+                window.addEventListener('click', this._onClickLock);
+
                 this.clock = new THREE.Clock();
                 this.sceneMgr.renderer.setAnimationLoop(() => this._update());
             }
@@ -879,34 +999,186 @@
             _snap() {
                 const pos = this.sceneMgr.dolly.position;
                 const h = this.hexGridMgr.getHeightAt(pos.x, pos.z);
-                this.sceneMgr.dolly.position.y = h + this.movement.STAND_Y;
+                this.sceneMgr.dolly.position.y = h + this.movement.baseEye;
             }
+
             _onResize() {
-                const width = window.innerWidth;
-                const height = window.innerHeight;
-                this.sceneMgr.camera.aspect = width / height;
+                const w = window.innerWidth, h = window.innerHeight;
+                this.sceneMgr.camera.aspect = w / h;
+                this.birdsCamera.aspect = w / h;
                 this.sceneMgr.camera.updateProjectionMatrix();
-                this.sceneMgr.renderer.setSize(width, height);
+                this.birdsCamera.updateProjectionMatrix();
+                this.sceneMgr.renderer.setSize(w, h);
+            }
+
+            _onWheel(evt) {
+                if (evt.deltaY > 0) {
+                    if (!this.isBirdsEye) this._enterBirdsEye();
+                } else {
+                    if (this.isBirdsEye) this._exitBirdsEye();
+                }
+            }
+
+            _enterBirdsEye() {
+                // request pointer lock immediately
+                this.sceneMgr.renderer.domElement.requestPointerLock();
+
+                // capture start spherical
+                const dollyPos = this.sceneMgr.dolly.position;
+                this.sceneMgr.camera.getWorldPosition(this._tempV || (this._tempV = new THREE.Vector3()));
+                this._tempV.sub(dollyPos);
+                this._birdsSphericalStart.setFromVector3(this._tempV);
+
+                // set target spherical to end-offset
+                this._birdsSphericalEnd.setFromVector3(this._birdsOffsetEnd);
+
+                this._birdsLerp = 0;
+                this.isBirdsEye = true;
+                this.shiftHoldTime = 0;
+            }
+
+            _exitBirdsEye() {
+                this.isBirdsEye = false;
+                clearTimeout(this._pitchResetTimeout);
+                this._resetPitch = false;
+                this.shiftHoldTime = 0;
+                // if still locked, exit pointer lock
+                if (document.pointerLockElement === this.sceneMgr.renderer.domElement) {
+                    document.exitPointerLock();
+                }
+            }
+
+            _onPointerLockChange() {
+                // update lock state only when in birds-eye
+                this.birdsPointerLocked = (
+                    this.isBirdsEye &&
+                    document.pointerLockElement === this.sceneMgr.renderer.domElement
+                );
+            }
+
+            _onClickLock() {
+                // on click, if zoomed-out but unlocked, re-request lock
+                if (this.isBirdsEye && !this.birdsPointerLocked) {
+                    this.sceneMgr.renderer.domElement.requestPointerLock();
+                }
+            }
+
+            _onBirdsMouse(evt) {
+                // only orbit if fully zoomed-out AND pointer locked
+                if (!this.isBirdsEye || this._birdsLerp < 1 || !this.birdsPointerLocked) return;
+
+                // yaw
+                this._birdsSphericalEnd.theta += -evt.movementX * 0.002;
+                // pitch
+                this._birdsSphericalEnd.phi += -evt.movementY * 0.002;
+                this._birdsSphericalEnd.phi = THREE.MathUtils.clamp(
+                    this._birdsSphericalEnd.phi,
+                    this._minPhi,
+                    this._maxPhi
+                );
+                // schedule pitch reset
+                clearTimeout(this._pitchResetTimeout);
+                this._resetPitch = false;
+                this._pitchResetTimeout = setTimeout(() => {
+                    this._resetPitch = true;
+                }, 200);
             }
 
             _update() {
                 const dt = this.clock.getDelta();
-
-                // ① read ground height & store it (do NOT touch eyeY)
                 const pos = this.sceneMgr.dolly.position;
+
+                // ground height
                 this.movement.groundY = this.hexGridMgr.getHeightAt(pos.x, pos.z);
 
-                // ② animate input & apply (uses the new groundY)
-                this.moveCtrl.update(dt);
-
-                // ③ keep generating / rendering
+                // first-person only when not zoomed out
+                if (!this.isBirdsEye) {
+                    this.moveCtrl.update(dt);
+                }
                 this.hexGridMgr.update(pos);
-                this.sceneMgr.renderer.render(this.sceneMgr.scene, this.sceneMgr.camera);
+
+                if (this.isBirdsEye) {
+                    // slide-in
+                    if (this._birdsLerp < 1) {
+                        this._birdsLerp = Math.min(1, this._birdsLerp + dt / 0.5);
+                    }
+
+                    // auto-reset pitch
+                    if (this._birdsLerp >= 1 && this._resetPitch) {
+                        const diff = this._basePhi - this._birdsSphericalEnd.phi;
+                        this._birdsSphericalEnd.phi += diff * Math.min(1, this._pitchEase * dt);
+                        if (Math.abs(diff) < 1e-3) {
+                            this._birdsSphericalEnd.phi = this._basePhi;
+                            this._resetPitch = false;
+                        }
+                    }
+
+                    // interpolate spherical
+                    this._birdsSphericalCur.radius = THREE.MathUtils.lerp(
+                        this._birdsSphericalStart.radius,
+                        this._birdsSphericalEnd.radius,
+                        this._birdsLerp
+                    );
+                    this._birdsSphericalCur.theta = THREE.MathUtils.lerp(
+                        this._birdsSphericalStart.theta,
+                        this._birdsSphericalEnd.theta,
+                        this._birdsLerp
+                    );
+                    this._birdsSphericalCur.phi = THREE.MathUtils.lerp(
+                        this._birdsSphericalStart.phi,
+                        this._birdsSphericalEnd.phi,
+                        this._birdsLerp
+                    );
+
+                    // offset vector
+                    const offset = this._offsetV || (this._offsetV = new THREE.Vector3());
+                    offset.setFromSpherical(this._birdsSphericalCur);
+
+                    // birds-eye movement speed
+                    if (this.movement.shift) {
+                        this.shiftHoldTime += dt;
+                    } else {
+                        this.shiftHoldTime = 0;
+                    }
+                    const walkMult = this.birdWalkMultiplier;
+                    const runMult = Math.min(
+                        this.maxBirdRunMultiplier,
+                        1 + this.shiftHoldTime * this.birdRunRampRate
+                    );
+                    const mult = this.movement.shift ? runMult : walkMult;
+                    const speed = this.consts.BASE_SPEED * dt * mult;
+
+                    // move relative to view
+                    const fwd = new THREE.Vector3();
+                    this.birdsCamera.getWorldDirection(fwd);
+                    fwd.y = 0; fwd.normalize();
+                    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
+
+                    if (this.movement.forward) pos.addScaledVector(fwd, speed);
+                    if (this.movement.backward) pos.addScaledVector(fwd, -speed);
+                    if (this.movement.left) pos.addScaledVector(right, -speed);
+                    if (this.movement.right) pos.addScaledVector(right, speed);
+
+                    // attach & look
+                    this.birdsCamera.position.copy(pos).add(offset);
+                    this.birdsCamera.lookAt(pos);
+
+                    this.sceneMgr.renderer.render(
+                        this.sceneMgr.scene,
+                        this.birdsCamera
+                    );
+                } else {
+                    this.sceneMgr.renderer.render(
+                        this.sceneMgr.scene,
+                        this.sceneMgr.camera
+                    );
+                }
             }
         }
 
-
         window.addEventListener('DOMContentLoaded', () => new App());
+
+
     </script>
     <!-- Note: include LZString library for compression/decompression -->
     <script src="https://cdn.jsdelivr.net/npm/lz-string@1.4.4/libs/lz-string.min.js"></script>
